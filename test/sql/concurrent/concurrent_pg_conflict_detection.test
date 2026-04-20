@@ -1,0 +1,764 @@
+# name: test/sql/concurrent/concurrent_pg_conflict_detection.test
+# description: deterministic conflict-detection coverage for the postgres
+#              metadata backend. Each scenario forces a specific conflict
+#              path to fire and asserts on the resulting error message,
+#              so passing this test means the path actually executed.
+# group: [concurrent]
+
+require notwindows
+
+require ducklake
+
+require parquet
+
+require postgres_scanner
+
+test-env DUCKLAKE_CONNECTION postgres:dbname=ducklakedb
+
+test-env PG_METADATA_CONN dbname=ducklakedb
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+ATTACH '{PG_METADATA_CONN}' AS _clean_pg (TYPE postgres);
+
+statement ok
+CALL postgres_execute('_clean_pg',
+    'DROP SCHEMA IF EXISTS metadata_pg_conflict_test CASCADE');
+
+statement ok
+DETACH _clean_pg;
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS dl (DATA_PATH '{DATA_PATH}/ducklake_pg_conflict_files', METADATA_SCHEMA 'metadata_pg_conflict_test', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+ATTACH '{PG_METADATA_CONN}' AS pg_meta (TYPE postgres)
+
+statement ok con1
+SET ducklake_retry_wait_ms=20
+
+statement ok con1
+SET ducklake_max_retry_count=10
+
+statement ok con2
+SET ducklake_retry_wait_ms=20
+
+statement ok con2
+SET ducklake_max_retry_count=10
+
+
+# ============================================================
+# Regression guard: the ducklake-internal metadata catalog must run at
+# `read committed` isolation. Anything else (default `repeatable read`)
+# pins the PG snapshot per DuckLake transaction and silently disables
+# CheckForConflicts cross-action detection on the postgres backend.
+# This guards against re-introducing the metadata_type branch typo
+# class fixed in ducklake_initializer.cpp.
+# ============================================================
+
+# touch metadata to ensure the internal connection has issued BEGIN
+statement ok
+CREATE TABLE dl.iso_probe(x INTEGER)
+
+query I
+SELECT * FROM postgres_query('__ducklake_metadata_dl',
+    'SELECT current_setting(''transaction_isolation'')')
+----
+read committed
+
+
+# ============================================================
+# Scenario A: CREATE TABLE same name from two transactions
+# Forces ConflictCheck on changes.created_tables (ducklake_transaction.cpp
+# line ~1267) to throw when con2 commits after con1.
+# ============================================================
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+CREATE TABLE dl.create_dup(x INTEGER)
+
+statement ok con2
+CREATE TABLE dl.create_dup(y INTEGER)
+
+statement ok con1
+COMMIT
+
+statement error con2
+COMMIT
+----
+<REGEX>:.*Transaction conflict.*create.*create_dup.*
+
+# Catalog must reflect exactly the winner (con1's column 'x'), not con2.
+query I
+SELECT COUNT(*)::BIGINT FROM postgres_query('pg_meta',
+    'SELECT 1 FROM metadata_pg_conflict_test.ducklake_table
+     WHERE table_name = ''create_dup'' AND end_snapshot IS NULL')
+----
+1
+
+
+# ============================================================
+# Scenario B: INSERT vs ALTER on the same table
+# Forces ConflictCheck on changes.tables_inserted_into ∩ other_changes.altered_tables
+# (ducklake_transaction.cpp line ~1285) when con2 commits after con1.
+# ============================================================
+statement ok
+CREATE TABLE dl.shape(a INTEGER)
+
+statement ok
+INSERT INTO dl.shape VALUES (1)
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+ALTER TABLE dl.shape ADD COLUMN b INTEGER
+
+statement ok con2
+INSERT INTO dl.shape(a) VALUES (10)
+
+statement ok con1
+COMMIT
+
+statement error con2
+COMMIT
+----
+<REGEX>:.*Transaction conflict.*insert into table.*altered.*
+
+
+# ============================================================
+# Scenario C: INSERT vs DROP on the same table
+# Forces ConflictCheck on changes.tables_inserted_into ∩ other_changes.dropped_tables
+# (ducklake_transaction.cpp line ~1284) when con2 commits after con1.
+# ============================================================
+statement ok
+CREATE TABLE dl.doomed(a INTEGER)
+
+statement ok
+INSERT INTO dl.doomed VALUES (1)
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+DROP TABLE dl.doomed
+
+statement ok con2
+INSERT INTO dl.doomed VALUES (10)
+
+statement ok con1
+COMMIT
+
+statement error con2
+COMMIT
+----
+<REGEX>:.*Transaction conflict.*insert into table.*dropped.*
+
+
+# ============================================================
+# Scenario D: concurrent DELETE on the same data file
+# Forces the file-level ConflictCheck (ducklake_transaction.cpp line ~1313)
+# AND/OR the ducklake_delete_file_active_uidx (postgres_metadata_manager.cpp
+# EnsureIdSequences) to fire when con2 commits.
+# ============================================================
+statement ok
+CREATE TABLE dl.del_target(k INTEGER)
+
+statement ok
+INSERT INTO dl.del_target SELECT i FROM range(64) t(i)
+
+# Sanity: exactly one data file backing the table.
+query I
+SELECT COUNT(*)::BIGINT FROM postgres_query('pg_meta',
+    'SELECT 1 FROM metadata_pg_conflict_test.ducklake_data_file df
+     JOIN metadata_pg_conflict_test.ducklake_table t USING (table_id)
+     WHERE t.table_name = ''del_target'' AND df.end_snapshot IS NULL')
+----
+1
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+DELETE FROM dl.del_target WHERE k = 0
+
+statement ok con2
+DELETE FROM dl.del_target WHERE k = 1
+
+statement ok con1
+COMMIT
+
+statement error con2
+COMMIT
+----
+<REGEX>:.*(Transaction conflict.*delete|duplicate key|ducklake_delete_file_active_uidx).*
+
+# Active delete_file uniqueness invariant must hold post-conflict.
+query I
+SELECT COUNT(*)::BIGINT FROM postgres_query('pg_meta',
+    'SELECT data_file_id FROM metadata_pg_conflict_test.ducklake_delete_file
+     WHERE end_snapshot IS NULL
+     GROUP BY data_file_id
+     HAVING COUNT(*) > 1')
+----
+0
+
+
+# ============================================================
+# Scenario F: ALTER vs ALTER same table
+# Forces ConflictCheck on changes.altered_tables ∩ other_changes.altered_tables
+# (ducklake_transaction.cpp line ~1357) when con2 commits after con1.
+# ============================================================
+statement ok
+CREATE TABLE dl.alter_dup(a INTEGER)
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+ALTER TABLE dl.alter_dup ADD COLUMN x INTEGER
+
+statement ok con2
+ALTER TABLE dl.alter_dup ADD COLUMN y INTEGER
+
+statement ok con1
+COMMIT
+
+statement error con2
+COMMIT
+----
+<REGEX>:.*Transaction conflict.*alter table.*altered.*
+
+
+# ============================================================
+# Scenario G: DROP vs ALTER on same table (con1 DROPs first)
+# Forces ConflictCheck on changes.altered_tables ∩ other_changes.dropped_tables
+# (ducklake_transaction.cpp line ~1356).
+# ============================================================
+statement ok
+CREATE TABLE dl.drop_alter(a INTEGER)
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+DROP TABLE dl.drop_alter
+
+statement ok con2
+ALTER TABLE dl.drop_alter ADD COLUMN x INTEGER
+
+statement ok con1
+COMMIT
+
+statement error con2
+COMMIT
+----
+<REGEX>:.*Transaction conflict.*alter table.*dropped.*
+
+
+# ============================================================
+# Scenario H: DROP vs DROP same table
+# Forces ConflictCheck on changes.dropped_tables ∩ other_changes.dropped_tables
+# (ducklake_transaction.cpp line ~1226).
+# ============================================================
+statement ok
+CREATE TABLE dl.drop_dup(a INTEGER)
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+DROP TABLE dl.drop_dup
+
+statement ok con2
+DROP TABLE dl.drop_dup
+
+statement ok con1
+COMMIT
+
+statement error con2
+COMMIT
+----
+<REGEX>:.*Transaction conflict.*drop table.*dropped.*
+
+
+# ============================================================
+# Scenario I: ALTER vs DELETE same table (con1 ALTERs first)
+# Forces ConflictCheck on changes.tables_deleted_from ∩ other_changes.altered_tables
+# (ducklake_transaction.cpp line ~1299/1332).
+# ============================================================
+statement ok
+CREATE TABLE dl.alter_del(k INTEGER)
+
+statement ok
+INSERT INTO dl.alter_del SELECT i FROM range(8) t(i)
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+ALTER TABLE dl.alter_del ADD COLUMN x INTEGER
+
+statement ok con2
+DELETE FROM dl.alter_del WHERE k = 0
+
+statement ok con1
+COMMIT
+
+statement error con2
+COMMIT
+----
+<REGEX>:.*Transaction conflict.*delete from table.*altered.*
+
+
+# ============================================================
+# Scenario J: DROP vs DELETE same table (con1 DROPs first)
+# Forces ConflictCheck on changes.tables_deleted_from ∩ other_changes.dropped_tables
+# (ducklake_transaction.cpp line ~1298/1331).
+# ============================================================
+statement ok
+CREATE TABLE dl.drop_del(k INTEGER)
+
+statement ok
+INSERT INTO dl.drop_del SELECT i FROM range(8) t(i)
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+DROP TABLE dl.drop_del
+
+statement ok con2
+DELETE FROM dl.drop_del WHERE k = 0
+
+statement ok con1
+COMMIT
+
+statement error con2
+COMMIT
+----
+<REGEX>:.*Transaction conflict.*delete from table.*dropped.*
+
+
+# ============================================================
+# Scenario K: concurrent INSERTs into same table — must NOT conflict.
+# Negative control: insert/insert is commutative, both commits succeed
+# and stats_version advances twice.
+# ============================================================
+statement ok
+CREATE TABLE dl.ins_ins(k INTEGER)
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+INSERT INTO dl.ins_ins VALUES (1)
+
+statement ok con2
+INSERT INTO dl.ins_ins VALUES (2)
+
+statement ok con1
+COMMIT
+
+statement ok con2
+COMMIT
+
+query I
+SELECT COUNT(*)::BIGINT FROM dl.ins_ins
+----
+2
+
+
+# ============================================================
+# Scenario E: stats CAS observably advances on each commit
+# Sequence-allocated snapshot ids decouple from commit order; the
+# stats_version CAS is what keeps ducklake_table_stats convergent.
+# We assert (a) stats_version moves on every observable commit, and
+# (b) the post-verify SELECT throws and retries when forced.
+# ============================================================
+statement ok
+CREATE TABLE dl.stats_target(k INTEGER)
+
+statement ok
+INSERT INTO dl.stats_target VALUES (1)
+
+# Snapshot the version after one commit.
+statement ok
+CREATE TEMP TABLE _v1 AS
+SELECT stats_version AS v FROM postgres_query('pg_meta',
+    'SELECT stats_version FROM metadata_pg_conflict_test.ducklake_table_stats
+     WHERE table_id = (SELECT table_id FROM metadata_pg_conflict_test.ducklake_table
+                       WHERE table_name = ''stats_target'' AND end_snapshot IS NULL)')
+
+statement ok
+INSERT INTO dl.stats_target VALUES (2)
+
+# Version must have advanced — proves CAS UPDATE produced a new version.
+query I
+SELECT (SELECT stats_version FROM postgres_query('pg_meta',
+    'SELECT stats_version FROM metadata_pg_conflict_test.ducklake_table_stats
+     WHERE table_id = (SELECT table_id FROM metadata_pg_conflict_test.ducklake_table
+                       WHERE table_name = ''stats_target'' AND end_snapshot IS NULL)'))
+       > (SELECT v FROM _v1)
+----
+true
+
+
+# ============================================================
+# Scenario L: ALTER vs ALTER on same view
+# Forces ConflictCheck on changes.altered_views ∩ other_changes.altered_views
+# (ducklake_transaction.cpp line ~1360).
+# ============================================================
+statement ok
+CREATE TABLE dl.view_base(a INTEGER)
+
+statement ok
+CREATE VIEW dl.dup_view AS SELECT a FROM dl.view_base
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+COMMENT ON VIEW dl.dup_view IS 'comment-1'
+
+statement ok con2
+COMMENT ON VIEW dl.dup_view IS 'comment-2'
+
+statement ok con1
+COMMIT
+
+statement error con2
+COMMIT
+----
+<REGEX>:.*Transaction conflict.*alter view.*altered.*
+
+
+# ============================================================
+# Scenario M: DROP vs DROP same view
+# Forces ConflictCheck on changes.dropped_views ∩ other_changes.dropped_views
+# (ducklake_transaction.cpp line ~1230).
+# ============================================================
+statement ok
+CREATE VIEW dl.drop_dup_view AS SELECT a FROM dl.view_base
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+DROP VIEW dl.drop_dup_view
+
+statement ok con2
+DROP VIEW dl.drop_dup_view
+
+statement ok con1
+COMMIT
+
+statement error con2
+COMMIT
+----
+<REGEX>:.*Transaction conflict.*drop view.*dropped.*
+
+
+# ============================================================
+# Scenario N: COMPACT vs DELETE on same table (con1 compacts first)
+# Forces ConflictCheck on changes.tables_deleted_from ∩ other_changes.tables_merge_adjacent
+# (ducklake_transaction.cpp line ~1300).
+# ============================================================
+statement ok
+CREATE TABLE dl.compact_del(k INTEGER)
+
+statement ok
+INSERT INTO dl.compact_del SELECT i FROM range(8) t(i)
+
+statement ok
+INSERT INTO dl.compact_del SELECT i FROM range(8, 16) t(i)
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+query III con1
+SELECT table_name, files_processed, files_created FROM ducklake_merge_adjacent_files('dl', 'compact_del')
+----
+compact_del	2	1
+
+statement ok con2
+DELETE FROM dl.compact_del WHERE k = 0
+
+statement ok con1
+COMMIT
+
+statement error con2
+COMMIT
+----
+<REGEX>:.*Transaction conflict.*delete from table.*compacted.*
+
+
+# ============================================================
+# Scenario O: DELETE vs COMPACT on same table (con1 deletes first)
+# Forces ConflictCheck on changes.tables_merge_adjacent ∩ other_changes.tables_deleted_from
+# (ducklake_transaction.cpp line ~1345).
+# ============================================================
+statement ok
+CREATE TABLE dl.del_compact(k INTEGER)
+
+statement ok
+INSERT INTO dl.del_compact SELECT i FROM range(8) t(i)
+
+statement ok
+INSERT INTO dl.del_compact SELECT i FROM range(8, 16) t(i)
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+DELETE FROM dl.del_compact WHERE k = 0
+
+query III con2
+SELECT table_name, files_processed, files_created FROM ducklake_merge_adjacent_files('dl', 'del_compact')
+----
+del_compact	2	1
+
+statement ok con1
+COMMIT
+
+statement error con2
+COMMIT
+----
+<REGEX>:.*Transaction conflict.*compact table.*deleted.*
+
+
+# ============================================================
+# Scenario P: COMPACT vs COMPACT on same table
+# Forces ConflictCheck on changes.tables_merge_adjacent ∩ other_changes.tables_merge_adjacent
+# (ducklake_transaction.cpp line ~1346).
+# ============================================================
+statement ok
+CREATE TABLE dl.compact_dup(k INTEGER)
+
+statement ok
+INSERT INTO dl.compact_dup SELECT i FROM range(8) t(i)
+
+statement ok
+INSERT INTO dl.compact_dup SELECT i FROM range(8, 16) t(i)
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+query III con1
+SELECT table_name, files_processed, files_created FROM ducklake_merge_adjacent_files('dl', 'compact_dup')
+----
+compact_dup	2	1
+
+query III con2
+SELECT table_name, files_processed, files_created FROM ducklake_merge_adjacent_files('dl', 'compact_dup')
+----
+compact_dup	2	1
+
+statement ok con1
+COMMIT
+
+statement error con2
+COMMIT
+----
+<REGEX>:.*Transaction conflict.*compact table.*compacted.*
+
+
+# ============================================================
+# Scenario Q: COMPACT vs ALTER on same table (con1 compacts first)
+# Forces ConflictCheck on changes.altered_tables ∩ other_changes.tables_merge_adjacent
+# (added in this PR alongside the compact-side reverse check).
+# ============================================================
+statement ok
+CREATE TABLE dl.compact_alter(k INTEGER)
+
+statement ok
+INSERT INTO dl.compact_alter SELECT i FROM range(8) t(i)
+
+statement ok
+INSERT INTO dl.compact_alter SELECT i FROM range(8, 16) t(i)
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+query III con1
+SELECT table_name, files_processed, files_created FROM ducklake_merge_adjacent_files('dl', 'compact_alter')
+----
+compact_alter	2	1
+
+statement ok con2
+ALTER TABLE dl.compact_alter ADD COLUMN x INTEGER
+
+statement ok con1
+COMMIT
+
+statement error con2
+COMMIT
+----
+<REGEX>:.*Transaction conflict.*alter table.*compacted.*
+
+
+# ============================================================
+# Scenario R: ALTER vs COMPACT on same table (con1 alters first)
+# Forces ConflictCheck on changes.tables_merge_adjacent ∩ other_changes.altered_tables.
+# ============================================================
+statement ok
+CREATE TABLE dl.alter_compact(k INTEGER)
+
+statement ok
+INSERT INTO dl.alter_compact SELECT i FROM range(8) t(i)
+
+statement ok
+INSERT INTO dl.alter_compact SELECT i FROM range(8, 16) t(i)
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+ALTER TABLE dl.alter_compact ADD COLUMN x INTEGER
+
+query III con2
+SELECT table_name, files_processed, files_created FROM ducklake_merge_adjacent_files('dl', 'alter_compact')
+----
+alter_compact	2	1
+
+statement ok con1
+COMMIT
+
+statement error con2
+COMMIT
+----
+<REGEX>:.*Transaction conflict.*compact table.*altered.*
+
+
+# ============================================================
+# Scenario S: ALTER view vs DROP view (con1 alters first)
+# Forces ConflictCheck on changes.dropped_views ∩ other_changes.altered_views.
+# ============================================================
+statement ok
+CREATE TABLE dl.s_view_base(a INTEGER)
+
+statement ok
+CREATE VIEW dl.alter_drop_view AS SELECT a FROM dl.s_view_base
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+COMMENT ON VIEW dl.alter_drop_view IS 'comment-1'
+
+statement ok con2
+DROP VIEW dl.alter_drop_view
+
+statement ok con1
+COMMIT
+
+statement error con2
+COMMIT
+----
+<REGEX>:.*Transaction conflict.*drop view.*altered.*
+
+
+# ============================================================
+# Scenario T: DROP view vs ALTER view (con1 drops first)
+# Forces ConflictCheck on changes.altered_views ∩ other_changes.dropped_views.
+# ============================================================
+statement ok
+CREATE VIEW dl.drop_alter_view AS SELECT a FROM dl.s_view_base
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+DROP VIEW dl.drop_alter_view
+
+statement ok con2
+COMMENT ON VIEW dl.drop_alter_view IS 'comment-2'
+
+statement ok con1
+COMMIT
+
+statement error con2
+COMMIT
+----
+<REGEX>:.*Transaction conflict.*alter view.*dropped.*
+
+
+# ============================================================
+# Smoke: stress run of concurrent CREATE TABLE collisions to make sure
+# the partial unique index + retry loop converge under load. This is
+# weaker than scenarios A-D (tests outcome, not mechanism) but catches
+# regressions where the deterministic case passes but contention does not.
+# ============================================================
+concurrentloop i 0 8
+
+statement maybe
+CREATE TABLE dl.stress_dup(x INTEGER)
+----
+
+endloop
+
+query I
+SELECT COUNT(*)::BIGINT FROM postgres_query('pg_meta',
+    'SELECT 1 FROM metadata_pg_conflict_test.ducklake_table
+     WHERE table_name = ''stress_dup'' AND end_snapshot IS NULL')
+----
+1

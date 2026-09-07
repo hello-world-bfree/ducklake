@@ -5145,10 +5145,10 @@ static MergedColumnStatsSQL MergeColumnStatsAssignments(const DuckLakeMetadataMa
 	} else {
 		result.min_val = StringUtil::Format("CASE WHEN %s IS NULL THEN %s ELSE %s END", stored_min, sql.min_val,
 		                                    MergeBoundExpression(dialect, col_stats, stored_min, sql.min_val, true));
-		result.min_is_exact = StringUtil::Format(
-		    "CASE WHEN %s IS NULL THEN %s ELSE %s END", stored_min, sql.min_is_exact,
-		    MergeExactnessExpression(dialect, col_stats, stored_min, sql.min_val, stored_min_is_exact,
-		                             sql.min_is_exact, true));
+		result.min_is_exact =
+		    StringUtil::Format("CASE WHEN %s IS NULL THEN %s ELSE %s END", stored_min, sql.min_is_exact,
+		                       MergeExactnessExpression(dialect, col_stats, stored_min, sql.min_val,
+		                                                stored_min_is_exact, sql.min_is_exact, true));
 	}
 	if (!col_stats.has_max || sql.max_val == "NULL") {
 		result.max_val = "NULL";
@@ -5156,10 +5156,10 @@ static MergedColumnStatsSQL MergeColumnStatsAssignments(const DuckLakeMetadataMa
 	} else {
 		result.max_val = StringUtil::Format("CASE WHEN %s IS NULL THEN %s ELSE %s END", stored_max, sql.max_val,
 		                                    MergeBoundExpression(dialect, col_stats, stored_max, sql.max_val, false));
-		result.max_is_exact = StringUtil::Format(
-		    "CASE WHEN %s IS NULL THEN %s ELSE %s END", stored_max, sql.max_is_exact,
-		    MergeExactnessExpression(dialect, col_stats, stored_max, sql.max_val, stored_max_is_exact,
-		                             sql.max_is_exact, false));
+		result.max_is_exact =
+		    StringUtil::Format("CASE WHEN %s IS NULL THEN %s ELSE %s END", stored_max, sql.max_is_exact,
+		                       MergeExactnessExpression(dialect, col_stats, stored_max, sql.max_val,
+		                                                stored_max_is_exact, sql.max_is_exact, false));
 	}
 	result.contains_null =
 	    sql.contains_null == "NULL"
@@ -5228,10 +5228,9 @@ string DuckLakeMetadataManager::UpdateGlobalTableStatsSql(const DuckLakeGlobalSt
 			    "contains_nan, min_value, max_value, extra_stats%s) VALUES (%d, %d, %s, %s, %s, %s, %s%s) "
 			    "ON CONFLICT (table_id, column_id) DO UPDATE SET "
 			    "contains_null=%s, contains_nan=%s, min_value=%s, max_value=%s, extra_stats=%s%s;",
-			    exactness_columns, stats.table_id.index, col_stats.column_id.index, sql.contains_null,
-			    sql.contains_nan, sql.min_val, sql.max_val, sql.extra_stats, exactness_values,
-			    assignments.contains_null, assignments.contains_nan, assignments.min_val, assignments.max_val,
-			    sql.extra_stats, exactness_set);
+			    exactness_columns, stats.table_id.index, col_stats.column_id.index, sql.contains_null, sql.contains_nan,
+			    sql.min_val, sql.max_val, sql.extra_stats, exactness_values, assignments.contains_null,
+			    assignments.contains_nan, assignments.min_val, assignments.max_val, sql.extra_stats, exactness_set);
 		}
 	} else {
 		// stats have been initialized - update them
@@ -5254,22 +5253,21 @@ string DuckLakeMetadataManager::UpdateGlobalTableStatsSql(const DuckLakeGlobalSt
 		// value, so MERGE needs no lock, CAS column or retry.
 		for (auto &col_stats : stats.column_stats) {
 			auto sql = ColumnStatsSQL::FromColumnStats(col_stats);
-			auto assignments =
-			    write_mode == GlobalStatsWrite::MERGE
-			        ? MergeColumnStatsAssignments(dialect, col_stats, sql)
-			        : MergedColumnStatsSQL {sql.contains_null, sql.contains_nan, sql.min_val, sql.max_val,
-			                                sql.min_is_exact, sql.max_is_exact};
+			auto assignments = write_mode == GlobalStatsWrite::MERGE
+			                       ? MergeColumnStatsAssignments(dialect, col_stats, sql)
+			                       : MergedColumnStatsSQL {sql.contains_null, sql.contains_nan, sql.min_val,
+			                                               sql.max_val,       sql.min_is_exact, sql.max_is_exact};
 			string exactness_set;
 			if (dialect.write_stats_exactness) {
 				exactness_set = StringUtil::Format(", min_is_exact=%s, max_is_exact=%s", assignments.min_is_exact,
 				                                   assignments.max_is_exact);
 			}
-			batch_query += StringUtil::Format(
-			    "UPDATE {METADATA_CATALOG}.ducklake_table_column_stats "
-			    "SET contains_null=%s, contains_nan=%s, min_value=%s, max_value=%s, "
-			    "extra_stats=%s%s WHERE table_id=%d AND column_id=%d;",
-			    assignments.contains_null, assignments.contains_nan, assignments.min_val, assignments.max_val,
-			    sql.extra_stats, exactness_set, stats.table_id.index, col_stats.column_id.index);
+			batch_query += StringUtil::Format("UPDATE {METADATA_CATALOG}.ducklake_table_column_stats "
+			                                  "SET contains_null=%s, contains_nan=%s, min_value=%s, max_value=%s, "
+			                                  "extra_stats=%s%s WHERE table_id=%d AND column_id=%d;",
+			                                  assignments.contains_null, assignments.contains_nan, assignments.min_val,
+			                                  assignments.max_val, sql.extra_stats, exactness_set, stats.table_id.index,
+			                                  col_stats.column_id.index);
 		}
 	}
 	return batch_query;

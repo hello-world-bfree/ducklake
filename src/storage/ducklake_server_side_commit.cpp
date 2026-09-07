@@ -792,7 +792,7 @@ DuckLakeCommitContext DuckLakeServerSideCommit::BuildContext(idx_t &committed_sn
 		return it == existing_table_stats.end() ? nullptr : it->second;
 	};
 	ctx.update_global_table_stats_sql = [this](const DuckLakeGlobalStatsInfo &stats,
-	                                          DuckLakeMetadataManager::GlobalStatsWrite write_mode) {
+	                                           DuckLakeMetadataManager::GlobalStatsWrite write_mode) {
 		DuckLakeMetadataManager::StatsMergeDialect dialect;
 		dialect.supports_upsert = supports_v1_1_metadata;
 		dialect.write_stats_exactness = supports_v1_1_metadata;

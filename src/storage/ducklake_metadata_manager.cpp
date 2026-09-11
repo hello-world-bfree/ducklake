@@ -245,7 +245,7 @@ string DuckLakeMetadataManager::GetTableColumnStatsTableStatement() {
 	// SQLite reject each other's CREATE INDEX schema-qualification.
 	return "CREATE TABLE {METADATA_CATALOG}.ducklake_table_column_stats(table_id BIGINT, column_id BIGINT, "
 	       "contains_null BOOLEAN, contains_nan BOOLEAN, min_value VARCHAR, max_value VARCHAR, extra_stats VARCHAR, "
-	       "min_is_exact BOOLEAN, max_is_exact BOOLEAN, PRIMARY KEY(table_id, column_id));";
+	       "PRIMARY KEY(table_id, column_id));";
 }
 
 string DuckLakeMetadataManager::GetCreateTableStatements() {
